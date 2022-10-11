@@ -184,6 +184,67 @@ public class OATManager {
                     })
                     .build();
 
+            LiteralCommandNode<ServerCommandSource> addNode = CommandManager
+                    .literal("add")
+                    .requires(source -> source.hasPermissionLevel(3))
+                    .build();
+
+            var addPlayer = CommandManager.argument("player", EntityArgumentType.player())
+                    .executes(context -> {
+                        ServerPlayerEntity _player = EntityArgumentType.getPlayer(context, "player");
+
+                        if (queue.contains(_player)) {
+                            context.getSource().sendMessage(Text.literal("Player already in queue"));
+                            return -1;
+                        }
+
+                        queue.add(_player);
+
+                        if (selectedPlayer == null) {
+                            selectedPlayer = _player;
+                        }
+
+                        context.getSource().sendMessage(Text.literal(String.format("Added %s to the queue",
+                                _player.getDisplayName().getString())));
+
+                        return 1;
+                    })
+                    .build();
+
+            LiteralCommandNode<ServerCommandSource> removeNode = CommandManager
+                    .literal("remove")
+                    .requires(source -> source.hasPermissionLevel(3))
+                    .build();
+
+            var removePlayer = CommandManager.argument("player", EntityArgumentType.player())
+                    .executes(context -> {
+                        ServerPlayerEntity _player = EntityArgumentType.getPlayer(context, "player");
+
+                        if (!queue.contains(_player)) {
+                            context.getSource().sendMessage(Text.literal("Player not in queue"));
+                            return -1;
+                        }
+
+                        if (selectedPlayer == _player) {
+                            if (queue.size() == 1)
+                                selectedPlayer = null;
+                            else
+                                switchPlayer(_player, getNext(_player));
+                        }
+
+                        queue.remove(_player);
+
+                        _player.getInventory().clear();
+                        _player.changeGameMode(GameMode.SURVIVAL);
+                        _player.setCameraEntity(null);
+
+                        context.getSource().sendMessage(Text.literal(String.format("Removed %s from the queue",
+                                _player.getDisplayName().getString())));
+
+                        return 1;
+                    })
+                    .build();
+
             dispatcher.getRoot().addChild(oatNode);
 
             //usage: /oat next
@@ -200,10 +261,14 @@ public class OATManager {
             //usage: /oat reset
             oatNode.addChild(resetTimeNode);
 
-            //usage: /oat queue [list|shuffle]
+            //usage: /oat queue [list | shuffle | add <player> | remove <player>]
             oatNode.addChild(queueNode);
             queueNode.addChild(listNode);
             queueNode.addChild(shuffleNode);
+            queueNode.addChild(addNode);
+            addNode.addChild(addPlayer);
+            queueNode.addChild(removeNode);
+            removeNode.addChild(removePlayer);
         });
     }
 
