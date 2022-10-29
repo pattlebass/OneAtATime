@@ -2,6 +2,8 @@
 
 This is a server-side mod that allows only a single person to play, while the rest spectate.
 
+![gameplay](https://pattlebass.github.io/assets/images/one-at-a-time.jpg)
+
 ## Commands
 
 * `/oat next` - Switch to the next player in the queue.
