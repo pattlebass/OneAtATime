@@ -3,7 +3,7 @@
   "id": "oat",
   "version": "${version}",
   "name": "One At a Time",
-  "description": "This is a server-side mod that allows only a single person to play, while the rest spectate.",
+  "description": "A mod that allows only a single person to play, while the rest spectate.\nMandatory on the server, optional on the client (recommended).",
   "authors": [
     "pattle_bass"
   ],

@@ -1,37 +1,41 @@
 package com.pattlebass.oneatatime;
 
 import com.mojang.brigadier.arguments.IntegerArgumentType;
-import com.mojang.brigadier.builder.RequiredArgumentBuilder;
 import com.mojang.brigadier.tree.LiteralCommandNode;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import net.fabricmc.fabric.api.networking.v1.PacketByteBufs;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.command.argument.EntityArgumentType;
-import net.minecraft.command.argument.MessageArgumentType;
 import net.minecraft.entity.boss.BossBar;
 import net.minecraft.entity.boss.ServerBossBar;
-import net.minecraft.entity.effect.StatusEffectInstance;
+import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.ItemStack;
-import net.minecraft.network.packet.s2c.play.*;
+import net.minecraft.network.PacketByteBuf;
+import net.minecraft.network.packet.s2c.play.GameStateChangeS2CPacket;
 import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
-import net.minecraft.text.MutableText;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
+import net.minecraft.util.Identifier;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.GameMode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
-import java.util.List;
+import java.util.Objects;
 
-import static net.minecraft.server.command.CommandManager.literal;
+import static com.pattlebass.oneatatime.Util.convertSeconds;
 
 public class OATManager {
     public static final Logger LOGGER = LoggerFactory.getLogger("OAT");
-    public static final List<ServerPlayerEntity> queue = new ArrayList<>();
+    public static final WrapAroundList<ServerPlayerEntity> queue = new WrapAroundList<>();
+    public static final ArrayList<ServerPlayerEntity> moddedPlayers = new ArrayList<>();
     public final ServerBossBar switchProgress = new ServerBossBar(Text.literal("Time left"), BossBar.Color.GREEN,
             BossBar.Style.PROGRESS);
     public int MAX_TIME = 1000;
@@ -39,6 +43,23 @@ public class OATManager {
     public ServerPlayerEntity selectedPlayer;
 
     public OATManager() {
+        registerCommands();
+
+        ServerPlayNetworking.registerGlobalReceiver(ClientSync.HANDSHAKE, (server, player, handler, buf,
+                                                                           responseSender) -> {
+            String playerVersion = buf.readString();
+            if (!Objects.equals(playerVersion, Main.VERSION)) {
+                server.execute(() -> {
+                    player.sendMessage(Text.of("One At a Time version mismatch. v%s (you) vs v%s (server)".formatted(playerVersion, Main.VERSION)));
+                });
+            } else {
+                moddedPlayers.add(player);
+                LOGGER.info("Added %s to modded list".formatted(player.getName().getString()));
+            }
+        });
+    }
+
+    private void registerCommands() {
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             LiteralCommandNode<ServerCommandSource> oatNode = CommandManager
                     .literal("oat")
@@ -49,7 +70,7 @@ public class OATManager {
                     .requires(source -> source.hasPermissionLevel(3))
                     .executes(context -> {
                         if (queue.size() > 1 && selectedPlayer != null) {
-                            switchPlayer(selectedPlayer, getNext(selectedPlayer));
+                            switchPlayer(selectedPlayer, queue.getNext(selectedPlayer));
                             time = 0;
                             context.getSource().sendMessage(Text.literal(
                                     "Switched to " + selectedPlayer.getDisplayName().getString()));
@@ -229,7 +250,7 @@ public class OATManager {
                             if (queue.size() == 1)
                                 selectedPlayer = null;
                             else
-                                switchPlayer(_player, getNext(_player));
+                                switchPlayer(_player, queue.getNext(_player));
                         }
 
                         queue.remove(_player);
@@ -276,6 +297,8 @@ public class OATManager {
         switchProgress.addPlayer(serverPlayer);
         queue.add(serverPlayer);
         if (selectedPlayer == null) switchPlayer(serverPlayer, serverPlayer);
+
+        ServerPlayNetworking.send(serverPlayer, ClientSync.HANDSHAKE, PacketByteBufs.create());
     }
 
     public void playerLeft(ServerPlayerEntity serverPlayer) {
@@ -283,7 +306,7 @@ public class OATManager {
             LOGGER.info("Player that left was selectedPlayer");
             if (queue.size() > 1) {
                 LOGGER.info("Queue was bigger than 1");
-                switchPlayer(selectedPlayer, getNext(selectedPlayer));
+                switchPlayer(selectedPlayer, queue.getNext(selectedPlayer));
             } else {
                 LOGGER.info("Queue was too small. Set selectedPlayer to null");
                 selectedPlayer = null;
@@ -314,30 +337,108 @@ public class OATManager {
         switchProgress.setName(Text.literal("Switch in: " + convertSeconds(MAX_TIME - time)));
 
         if (time >= MAX_TIME && selectedPlayer != null) {
-            switchPlayer(selectedPlayer, getNext(selectedPlayer));
+            switchPlayer(selectedPlayer, queue.getNext(selectedPlayer));
             time = 0;
         }
 
         queue.forEach((player) -> {
             if (player != selectedPlayer) {
-                copyEffects(selectedPlayer, player);
+                player.interactionManager.changeGameMode(GameMode.SPECTATOR);
+
+                player.teleport(selectedPlayer.getWorld(), selectedPlayer.getX(), selectedPlayer.getY(),
+                        selectedPlayer.getZ(), selectedPlayer.getYaw(), selectedPlayer.getPitch());
                 player.sendMessage(Text.literal(Formatting.WHITE + "Spectating " + Formatting.AQUA +
                         selectedPlayer.getDisplayName().getString()), true);
             }
         });
-
-        //LOGGER.info(String.valueOf(selectedPlayer));
     }
+
+    // Sync variables
+    private int lastScreenId = -1;
+    private int lastSelectedSlot = -1;
+    private int lastFoodLevel = -1;
+    private float lastSaturationLevel = (float) -1.0;
+    private Collection<ItemStack> lastHotbar;
 
     public void tick() {
         queue.forEach((player) -> {
             if (player != selectedPlayer) {
-                player.teleport(selectedPlayer.getWorld(), selectedPlayer.getX(), selectedPlayer.getY(),
-                        selectedPlayer.getZ(), selectedPlayer.getYaw(), selectedPlayer.getPitch());
-                player.setCameraEntity(selectedPlayer);
-                copyInventory(selectedPlayer, player);
-                player.changeGameMode(GameMode.SPECTATOR);
-                player.networkHandler.sendPacket(new GameStateChangeS2CPacket(GameStateChangeS2CPacket.GAME_MODE_CHANGED, GameMode.SURVIVAL.getId()));
+                // Hotbar slot
+                if (lastSelectedSlot != selectedPlayer.getInventory().selectedSlot ||
+                        player.getInventory().selectedSlot != selectedPlayer.getInventory().selectedSlot) {
+                    PacketByteBuf buf = PacketByteBufs.create();
+                    buf.writeInt(selectedPlayer.getId());
+                    buf.writeInt(selectedPlayer.getInventory().selectedSlot);
+                    ServerPlayNetworking.send(player, ClientSync.CHANGE_HOTBAR_SLOT, buf);
+
+                    lastSelectedSlot = selectedPlayer.getInventory().selectedSlot;
+                }
+
+                // Hotbar items
+                {
+                    Collection<ItemStack> hotbar = selectedPlayer.getInventory().main.subList(0,
+                            PlayerInventory.getHotbarSize());
+                    Collection<ItemStack> invToSend = new ArrayList<>(hotbar);
+                    invToSend.add(selectedPlayer.getInventory().getStack(PlayerInventory.OFF_HAND_SLOT));
+
+                    if (lastHotbar != invToSend) {
+                        PacketByteBuf buf = PacketByteBufs.create();
+                        buf.writeInt(selectedPlayer.getId());
+                        buf.writeCollection(invToSend, PacketByteBuf::writeItemStack);
+                        ServerPlayNetworking.send(player, ClientSync.CHANGE_HOTBAR_INVENTORY, buf);
+
+                        lastHotbar = invToSend;
+                    }
+                }
+
+                // Level
+                {
+                    int exp1 = player.experienceLevel;
+                    int exp2 = selectedPlayer.experienceLevel;
+                    if (exp1 != exp2 || player.experienceProgress != selectedPlayer.experienceProgress) {
+                        player.experienceProgress = selectedPlayer.experienceProgress;
+                        player.setExperienceLevel(selectedPlayer.experienceLevel);
+                    }
+                }
+
+                // Food
+                int selectedFood = selectedPlayer.getHungerManager().getFoodLevel();
+                int playerFood = player.getHungerManager().getFoodLevel();
+                float selectedSaturation = player.getHungerManager().getFoodLevel();
+                float playerSaturation = player.getHungerManager().getFoodLevel();
+                if (lastFoodLevel != selectedFood || lastSaturationLevel != selectedSaturation ||
+                        playerFood != selectedFood || playerSaturation != selectedSaturation) {
+                    PacketByteBuf buf = PacketByteBufs.create();
+                    buf.writeInt(selectedPlayer.getId());
+                    buf.writeInt(selectedPlayer.getHungerManager().getFoodLevel());
+                    buf.writeFloat(selectedPlayer.getHungerManager().getSaturationLevel());
+                    ServerPlayNetworking.send(player, ClientSync.UPDATE_FOOD, buf);
+
+                    lastFoodLevel = selectedPlayer.getHungerManager().getFoodLevel();
+                    lastSaturationLevel = selectedPlayer.getHungerManager().getSaturationLevel();
+                }
+
+                if (player.getCameraEntity() != selectedPlayer) {
+                    player.setCameraEntity(selectedPlayer);
+                }
+
+                if (!ClientSync.sameInventory(selectedPlayer, player)) {
+                    ClientSync.copyInventory(selectedPlayer, player);
+                }
+
+                if (!ClientSync.sameEffects(selectedPlayer, player)) {
+                    ClientSync.copyEffects(selectedPlayer, player);
+                }
+
+                if (lastScreenId != selectedPlayer.currentScreenHandler.syncId) {
+                    ClientSync.copyScreen(selectedPlayer, player);
+                    lastScreenId = selectedPlayer.currentScreenHandler.syncId;
+                }
+
+                if (!moddedPlayers.contains(player)) {
+                    player.networkHandler.sendPacket(new GameStateChangeS2CPacket(GameStateChangeS2CPacket
+                            .GAME_MODE_CHANGED, GameMode.SURVIVAL.getId()));
+                }
             }
         });
     }
@@ -347,53 +448,23 @@ public class OATManager {
         Vec3d pos = oldPlayer.getPos();
         float yaw = oldPlayer.getYaw();
         float pitch = oldPlayer.getPitch();
+        float health = oldPlayer.getHealth();
+        int food = oldPlayer.getHungerManager().getFoodLevel();
+        float saturation = oldPlayer.getHungerManager().getSaturationLevel();
 
         oldPlayer.changeGameMode(GameMode.SPECTATOR);
+        oldPlayer.getAbilities().flying = true;
+        oldPlayer.closeHandledScreen();
 
         selectedPlayer = newPlayer;
 
+        ClientSync.copyInventory(oldPlayer, newPlayer);
         newPlayer.teleport(world, pos.x, pos.y, pos.z, yaw, pitch);
         newPlayer.changeGameMode(GameMode.SURVIVAL);
+        newPlayer.getAbilities().flying = false;
+        newPlayer.setHealth(health);
+        newPlayer.getHungerManager().setFoodLevel(food);
+        newPlayer.getHungerManager().setSaturationLevel(saturation);
         newPlayer.sendMessage(Text.literal(Formatting.GOLD + "You are playing!"), true);
-    }
-
-    private void copyInventory(ServerPlayerEntity from, ServerPlayerEntity to) {
-        for (int i = 0; i < 41; i++) {
-            ItemStack stack = from.getInventory().getStack(i);
-            to.getInventory().setStack(i, stack);
-        }
-    }
-
-    private void copyEffects(ServerPlayerEntity from, ServerPlayerEntity to) {
-        to.clearStatusEffects();
-        from.getStatusEffects().forEach((effect) -> {
-            to.addStatusEffect(new StatusEffectInstance(effect.getEffectType(), effect.getDuration(),
-                    effect.getAmplifier()));
-        });
-    }
-
-    public ServerPlayerEntity getNext(ServerPlayerEntity uid) {
-        int idx = queue.indexOf(uid);
-        if (idx + 1 == queue.size()) return queue.get(0);
-        return queue.get(idx + 1);
-    }
-
-    public ServerPlayerEntity getPrevious(ServerPlayerEntity uid) {
-        int idx = queue.indexOf(uid);
-        if (idx == 0) return queue.get(queue.size() - 1);
-        return queue.get(idx - 1);
-    }
-
-    public static String convertSeconds(int seconds) {
-        int h = seconds / 3600;
-        int m = (seconds % 3600) / 60;
-        int s = seconds % 60;
-        String sh = (h > 0 ? String.valueOf(h) + " " + "h" : "");
-        String sm = (m < 10 && m > 0 && h > 0 ? "0" : "") +
-                (m > 0 ? (h > 0 && s == 0 ? String.valueOf(m) : String.valueOf(m) + " " + "min") : "");
-        String ss = (
-                s == 0 && (h > 0 || m > 0) ? "" :
-                        (s < 10 && (h > 0 || m > 0) ? "0" : "") + String.valueOf(s) + " " + "sec");
-        return sh + (h > 0 ? " " : "") + sm + (m > 0 ? " " : "") + ss;
     }
 }
